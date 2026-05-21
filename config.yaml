@@ -1,39 +1,41 @@
 experiment:
   n_clients: 10
-  n_rounds: 15
-  local_epochs: 1
+  n_rounds: 150
+  local_epochs: 5
 
 gossip:
   fanout: 2
   max_hops: 3
 
-security:
-  use_hash: true
-  hash_algorithm: sha256
-
-crypto:
-  scheme: dilithium2
-
 logging:
   log_file: experiment.log
   log_level: INFO
 
+dp:
+  enabled: true
+  clip_norm: 0.5
+  epsilon: 0.5
+  delta: 1e-5
+  auto_noise: true
+  base_noise: 0.05
+  n_clients_sim: 10
+
 training:
-  learning_rate: 0.001
+  optimizer: adam
+  learning_rate: 0.01
 
 model:
-  name: smallcnn
+  name: lenet
   input_channels: 1
   input_height: 28
   input_width: 28
   conv1_channels: 16
   conv2_channels: 32
-  hidden_dim: 128
   num_classes: 10
 
 data:
   dataset_name: ylecun/mnist
-  batch_size: 32
+  batch_size: 64
   test_batch_size: 256
   alpha: 0.5
   partition_by: label
