@@ -1,3 +1,4 @@
+
 experiment:
   n_clients: 10
   n_rounds: 150
@@ -14,7 +15,7 @@ logging:
 dp:
   enabled: true
   clip_norm: 0.5
-  epsilon: 0.8
+  epsilon: 1.0
   delta: 1e-5
   auto_noise: true
   base_noise: 0.05
