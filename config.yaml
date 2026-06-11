@@ -14,7 +14,7 @@ logging:
 dp:
   enabled: true
   clip_norm: 0.5
-  epsilon: 0.5
+  epsilon: 0.8
   delta: 1e-5
   auto_noise: true
   base_noise: 0.05
@@ -22,7 +22,7 @@ dp:
 
 training:
   optimizer: adam
-  learning_rate: 0.01
+  learning_rate: 0.001
 
 model:
   name: lenet
