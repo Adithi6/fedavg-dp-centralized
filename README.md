@@ -44,7 +44,7 @@ Unlike traditional Federated Learning systems, this implementation does not rely
 | Optimizer | Adam |
 | Learning Rate | 0.001 |
 | Batch Size | 64 |
-| DP Epsilon (ε) | 1.5 |
+| DP Epsilon (ε) | 1.0 |
 | DP Delta (δ) | 1e-5 |
 | Clip Norm | 0.5 |
 | Gossip Fanout | 2 |
