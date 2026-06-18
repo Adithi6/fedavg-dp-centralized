@@ -4,12 +4,16 @@ import time
 import random
 import os
 
+import numpy as np
 import torch
 
 from data.loader import make_client_loaders
-from gossip.node import GossipNode
-from gossip.protocol import GossipProtocol
-from utils.weights import model_to_weight_arrays
+from client.fl_client import FederatedClient
+from utils.weights import (
+    model_to_weight_arrays,
+    apply_weight_arrays,
+    bytes_to_weight_arrays,
+)
 
 
 # -------------------------------------------------------------------
@@ -75,23 +79,20 @@ def _to_bool_string(value) -> str:
 
 def apply_dp_config_to_environment(config: dict):
     """
-    Bridge YAML DP config to FederatedClient.
+    Bridge YAML DP config to FederatedClient via environment variables.
 
-    This version supports epsilon-based automatic noise:
+    If auto_noise = true:
+        noise_std = base_noise / epsilon
 
-        if auto_noise = true:
-            noise_std = base_noise / epsilon
-
-    This makes changing epsilon meaningful:
-        lower epsilon -> higher noise -> stronger privacy -> lower accuracy
-        higher epsilon -> lower noise -> weaker privacy -> higher accuracy
+    Lower epsilon -> higher noise -> stronger privacy -> lower accuracy.
+    Higher epsilon -> lower noise -> weaker privacy -> higher accuracy.
     """
     dp = config.get("dp", {})
     training = config.get("training", {})
 
     dp_enabled = dp.get("enabled", True)
     dp_clip_norm = float(dp.get("clip_norm", 0.5))
-    dp_epsilon = float(dp.get("epsilon", 0.9))
+    dp_epsilon = float(dp.get("epsilon", 1.0))
     dp_delta = float(dp.get("delta", 1e-5))
 
     dp_auto_noise = dp.get("auto_noise", True)
@@ -137,7 +138,7 @@ def get_effective_noise_std(config: dict) -> float:
     """
     dp = config.get("dp", {})
 
-    epsilon = float(dp.get("epsilon", 0.9))
+    epsilon = float(dp.get("epsilon", 1.0))
     auto_noise = str(dp.get("auto_noise", True)).lower() in ["true", "1", "yes"]
     base_noise = float(dp.get("base_noise", 0.05))
     manual_noise = float(dp.get("noise_std", 0.01))
@@ -150,11 +151,10 @@ def get_effective_noise_std(config: dict) -> float:
 
 def log_experiment_summary(config: dict):
     """
-    Log key experiment settings.
+    Log key experiment settings for Centralized FedAvg + Differential Privacy.
     """
     experiment = config["experiment"]
-    gossip = config["gossip"]
-    model = config["model"]
+    model_cfg = config["model"]
     data = config["data"]
     dp = config.get("dp", {})
     training = config["training"]
@@ -164,8 +164,8 @@ def log_experiment_summary(config: dict):
     logging.info("-" * 80)
     logging.info("Experiment Configuration Summary")
     logging.info("-" * 80)
-
-    logging.info("Approach: FedAvg + DP")
+    logging.info("Approach: Centralized FedAvg + Differential Privacy")
+    logging.info("Architecture: Central Server -> Clients -> Central Server Aggregation")
 
     logging.info(
         f"FL: clients={experiment['n_clients']} | "
@@ -174,15 +174,10 @@ def log_experiment_summary(config: dict):
     )
 
     logging.info(
-        f"Gossip: fanout={gossip['fanout']} | "
-        f"max_hops={gossip['max_hops']}"
-    )
-
-    logging.info(
-        f"Model: {model['name']} | "
-        f"conv1={model['conv1_channels']} | "
-        f"conv2={model['conv2_channels']} | "
-        f"classes={model['num_classes']}"
+        f"Model: {model_cfg['name']} | "
+        f"conv1={model_cfg['conv1_channels']} | "
+        f"conv2={model_cfg['conv2_channels']} | "
+        f"classes={model_cfg['num_classes']}"
     )
 
     logging.info(
@@ -201,7 +196,7 @@ def log_experiment_summary(config: dict):
     logging.info(
         f"DP: enabled={dp.get('enabled', True)} | "
         f"clip_norm={dp.get('clip_norm', 0.5)} | "
-        f"epsilon={dp.get('epsilon', 0.9)} | "
+        f"epsilon={dp.get('epsilon', 1.0)} | "
         f"delta={dp.get('delta', 1e-5)} | "
         f"auto_noise={dp.get('auto_noise', True)} | "
         f"base_noise={dp.get('base_noise', 0.05)} | "
@@ -212,69 +207,118 @@ def log_experiment_summary(config: dict):
 
 
 # -------------------------------------------------------------------
-# FL Helpers
+# Central Server Helpers
 # -------------------------------------------------------------------
 
-def choose_aggregator_node(nodes):
+def build_global_model(model_config: dict, device: str):
     """
-    Select the node that received the maximum number of submissions.
-
-    If multiple nodes have the same maximum count, select one randomly.
+    Central server initializes the global model from scratch.
     """
-    counts = []
+    from model.cnn import LeNet
 
-    for node in nodes:
-        submissions = node.get_all_submissions()
-        count = len(submissions)
-        counts.append((node, count))
-
-        logging.info(
-            f"[aggregator-selection] {node.client_id} submissions={count}"
-        )
-
-    max_count = max(count for _, count in counts)
-
-    candidates = [
-        node for node, count in counts
-        if count == max_count
-    ]
-
-    aggregator = random.choice(candidates)
+    model = LeNet(
+        input_channels=int(model_config["input_channels"]),
+        num_classes=int(model_config["num_classes"]),
+        input_height=int(model_config["input_height"]),
+        input_width=int(model_config["input_width"]),
+        conv1_channels=int(model_config["conv1_channels"]),
+        conv2_channels=int(model_config["conv2_channels"]),
+    ).to(device)
 
     logging.info(
-        f"Selected aggregator: {aggregator.client_id} | "
-        f"submissions={max_count}"
+        "Central server: global model initialized | "
+        f"model={model_config['name']} | device={device}"
     )
 
-    return aggregator
+    return model
 
 
-def sync_weights_to_all_nodes(nodes, weights):
+def server_broadcast_weights(clients: list, global_model) -> list:
     """
-    Synchronize aggregated model weights to all clients.
-
-    This uses local_train(..., epochs=0), because the client implementation
-    applies global weights before checking epochs.
+    Central server sends global model weights to all clients.
     """
-    for node in nodes:
-        node.local_train(weights, epochs=0)
+    global_weights = model_to_weight_arrays(global_model)
 
-    logging.info("Aggregated weights synced to all nodes")
+    for client in clients:
+        apply_weight_arrays(client.model, global_weights)
+
+    logging.info(
+        f"Central server: broadcasted global weights to {len(clients)} clients"
+    )
+
+    return global_weights
 
 
-def clear_round_state(nodes, gossip):
+def server_fedavg_aggregate(
+    submissions: list,
+    global_model,
+    weight_dtype: str,
+) -> list:
     """
-    Clear round-specific node submissions and gossip state.
-    """
-    for node in nodes:
-        node.clear_submissions()
+    Central server performs weighted FedAvg aggregation over all client updates.
 
-    gossip.reset_round()
+    Formula:
+        w_global = sum_k (n_k / n_total) * w_k
+
+    where:
+        n_k = number of samples at client k
+        w_k = DP-protected model weights from client k
+    """
+    logging.info(
+        "Central server aggregating client updates | "
+        f"submissions={len(submissions)}"
+    )
+
+    weight_sets = []
+    sample_counts = []
+
+    for sub in submissions:
+        arrays = bytes_to_weight_arrays(
+            sub["update_bytes"],
+            global_model,
+            dtype_name=weight_dtype,
+        )
+        weight_sets.append(arrays)
+        sample_counts.append(int(sub.get("num_samples", 1)))
+
+    if not weight_sets:
+        logging.warning("Central server: no valid weight sets for aggregation")
+        return None
+
+    total_samples = sum(sample_counts)
+
+    if total_samples <= 0:
+        logging.warning("Central server: invalid total sample count; using equal weights")
+        sample_counts = [1] * len(weight_sets)
+        total_samples = len(weight_sets)
+
+    # Weighted FedAvg
+    averaged = []
+
+    for layer_idx in range(len(weight_sets[0])):
+        weighted_layer = np.zeros_like(weight_sets[0][layer_idx])
+
+        for client_idx, w in enumerate(weight_sets):
+            weight_factor = sample_counts[client_idx] / total_samples
+            weighted_layer += weight_factor * w[layer_idx]
+
+        averaged.append(weighted_layer)
+
+    apply_weight_arrays(global_model, averaged)
+
+    logging.info(
+        "Central server: FedAvg aggregation completed | "
+        f"updates={len(weight_sets)} | "
+        f"total_samples={total_samples} | "
+        f"sample_counts={sample_counts}"
+    )
+
+    return averaged
 
 
 def evaluate_model(model, test_loader, device: str) -> float:
     """
-    Evaluate global model on test data.
+    Central server evaluates global model accuracy on test set.
     """
     model.eval()
 
@@ -304,6 +348,10 @@ def main():
     config = load_config("config.yaml")
     setup_logging(config)
 
+    logging.info("=" * 80)
+    logging.info("Centralized FedAvg + Differential Privacy")
+    logging.info("=" * 80)
+
     data_config = config["data"]
     seed = int(data_config.get("seed", 42))
 
@@ -314,9 +362,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Using device: {device}")
 
-    # ---------------- BASIC CONFIG ----------------
+    # ---------------- EXTRACT CONFIG ----------------
     experiment_config = config["experiment"]
-    gossip_config = config["gossip"]
     training_config = config["training"]
     model_config = config["model"]
     weights_config = config["weights"]
@@ -325,12 +372,8 @@ def main():
     n_clients = int(experiment_config["n_clients"])
     n_rounds = int(experiment_config["n_rounds"])
     local_epochs = int(experiment_config["local_epochs"])
-
-    gossip_fanout = int(gossip_config["fanout"])
-    gossip_max_hops = int(gossip_config["max_hops"])
-
     learning_rate = float(training_config["learning_rate"])
-    dp_n_clients_sim = int(dp_config.get("n_clients_sim", n_clients))
+    weight_dtype = weights_config["dtype"]
 
     effective_noise = get_effective_noise_std(config)
 
@@ -349,55 +392,52 @@ def main():
         normalize_std=data_config["normalize_std"],
     )
 
-    # ---------------- NODES ----------------
-    nodes = []
+    # ---------------- STEP 1: Central Server Initializes Global Model ----------------
+    logging.info("=" * 80)
+    logging.info("STEP 1: Central server initializing global model")
+    logging.info("=" * 80)
+
+    global_model = build_global_model(model_config, device)
+
+    # ---------------- STEP 2: Create Federated Clients ----------------
+    logging.info("=" * 80)
+    logging.info("STEP 2: Initializing federated clients")
+    logging.info("=" * 80)
+
+    clients = []
+    client_sample_counts = []
 
     for i in range(n_clients):
-        node = GossipNode(
+        client = FederatedClient(
             client_id=f"client_{i}",
             dataloader=client_loaders[i],
             device=device,
             learning_rate=learning_rate,
             model_name=model_config["name"],
-            weight_dtype=weights_config["dtype"],
+            weight_dtype=weight_dtype,
             input_channels=int(model_config["input_channels"]),
             num_classes=int(model_config["num_classes"]),
             input_height=int(model_config["input_height"]),
             input_width=int(model_config["input_width"]),
             conv1_channels=int(model_config["conv1_channels"]),
             conv2_channels=int(model_config["conv2_channels"]),
-            n_clients_sim=dp_n_clients_sim,
+            n_clients_sim=int(dp_config.get("n_clients_sim", n_clients)),
         )
+        clients.append(client)
+        client_sample_counts.append(len(client_loaders[i].dataset))
 
-        nodes.append(node)
+    logging.info(f"Initialized {len(clients)} federated clients")
 
-    logging.info(f"Created {len(nodes)} gossip FL nodes")
+    # Initial broadcast + evaluate
+    server_broadcast_weights(clients, global_model)
 
-    # ---------------- GOSSIP ----------------
-    gossip = GossipProtocol(
-        fanout=gossip_fanout,
-        max_hops=gossip_max_hops,
-        seed=seed,
-    )
-
-    # ---------------- INITIAL MODEL SYNC ----------------
-    initializer = random.choice(nodes)
-    init_weights = model_to_weight_arrays(initializer.client.model)
-
-    sync_weights_to_all_nodes(nodes, init_weights)
-
+    initial_accuracy = evaluate_model(global_model, test_loader, device)
     logging.info(
-        f"Initial global model taken from {initializer.client_id} "
-        f"and synced to all nodes"
+        f"Central server: initial global test accuracy (before training): "
+        f"{initial_accuracy * 100:.2f}%"
     )
 
-    initial_accuracy = evaluate_model(initializer.client.model, test_loader, device)
-
-    logging.info(
-        f"Initial global test accuracy before training: {initial_accuracy * 100:.2f}%"
-    )
-
-    # ---------------- TRAINING ----------------
+    # ---------------- TRAINING ROUNDS ----------------
     experiment_start_time = time.time()
 
     round_accuracies = []
@@ -407,102 +447,68 @@ def main():
         round_start_time = time.time()
 
         logging.info("=" * 80)
-        logging.info(f"Round {round_id}/{n_rounds}")
+        logging.info(f"Round {round_id}/{n_rounds} | Centralized FedAvg + Differential Privacy")
         logging.info("=" * 80)
 
-        clear_round_state(nodes, gossip)
+        # ---- STEP 2: Server sends global model weights to all clients ----
+        logging.info(f"Round {round_id}: central server broadcasting global weights to all clients")
+        server_broadcast_weights(clients, global_model)
 
-        # 1. Local training from latest synced model
-        logging.info(f"Round {round_id}: local training started")
+        # ---- STEP 3 & 4: Each client trains locally ----
+        logging.info(f"Round {round_id}: clients performing local training")
 
-        for node in nodes:
-            node.local_train(None, epochs=local_epochs)
+        for client in clients:
+            client.local_train(global_weight_arrays=None, epochs=local_epochs)
 
-        logging.info(f"Round {round_id}: local training completed")
+        logging.info(f"Round {round_id}: local training completed for all clients")
 
-        # 2. Prepare DP-updated model updates
-        logging.info(f"Round {round_id}: preparing client updates")
+        # ---- STEP 5 & 6: Each client computes DP-protected update and sends to server ----
+        logging.info(f"Round {round_id}: clients preparing DP-protected updates for central server")
 
-        for node in nodes:
-            node.prepare_update()
+        submissions = []
 
-        logging.info(f"Round {round_id}: client updates prepared")
+        for client, n_samples in zip(clients, client_sample_counts):
+            payload = client.prepare_update()
+            payload["num_samples"] = n_samples
+            submissions.append(payload)
 
-        # 3. Gossip propagation
-        logging.info(f"Round {round_id}: gossip propagation started")
+        logging.info(
+            f"Round {round_id}: received {len(submissions)}/{n_clients} "
+            f"DP-protected updates at central server"
+        )
 
-        gossip.run_round(nodes)
-        gossip.print_gossip_summary()
+        # ---- STEP 7 & 8: Server performs FedAvg aggregation ----
+        logging.info(f"Round {round_id}: central server performing FedAvg aggregation")
 
-        logging.info(f"Round {round_id}: gossip propagation completed")
-
-        # 4. Select aggregator
-        aggregator = choose_aggregator_node(nodes)
-        submissions = aggregator.get_all_submissions()
-
-        if len(submissions) == n_clients:
-            logging.info(
-                f"[{aggregator.client_id}] complete aggregation possible | "
-                f"{len(submissions)}/{n_clients} submissions"
-            )
-        else:
-            logging.warning(
-                f"[{aggregator.client_id}] incomplete aggregation | "
-                f"{len(submissions)}/{n_clients} submissions available"
-            )
-
-        if len(submissions) == 0:
-            round_time = time.time() - round_start_time
-            round_times.append(round_time)
-
-            logging.warning(
-                f"Round {round_id} skipped because no submissions were available"
-            )
-            logging.info(
-                f"Round {round_id} summary | accuracy=N/A | round_time={round_time:.2f}s"
-            )
-            continue
-
-        # 5. Aggregate
-        averaged_weights = aggregator.aggregate_local_updates(
+        averaged_weights = server_fedavg_aggregate(
             submissions,
-            aggregator.client.model,
+            global_model,
+            weight_dtype=weight_dtype,
         )
 
         if averaged_weights is None:
             round_time = time.time() - round_start_time
             round_times.append(round_time)
-
-            logging.warning(
-                f"Round {round_id} skipped because aggregation returned None"
-            )
-            logging.info(
-                f"Round {round_id} summary | accuracy=N/A | round_time={round_time:.2f}s"
-            )
+            logging.warning(f"Round {round_id} skipped: aggregation returned None")
+            logging.info(f"Round {round_id} summary | accuracy=N/A | round_time={round_time:.2f}s")
             continue
 
-        # 6. Sync aggregated global model to all clients
-        weights = model_to_weight_arrays(aggregator.client.model)
-        sync_weights_to_all_nodes(nodes, weights)
-
-        # 7. Evaluate global model
-        accuracy = evaluate_model(aggregator.client.model, test_loader, device)
+        # ---- STEP 9: Server evaluates accuracy ----
+        accuracy = evaluate_model(global_model, test_loader, device)
         round_accuracies.append(accuracy)
 
         logging.info(
-            f"Round {round_id} global test accuracy: {accuracy * 100:.2f}%"
+            f"Round {round_id}: central server global test accuracy: {accuracy * 100:.2f}%"
         )
 
-        # 8. Log DP setting instead of misleading huge calculated epsilon
         logging.info(
             f"Round {round_id} DP setting | "
-            f"target_epsilon={dp_config.get('epsilon', 0.9)} | "
+            f"target_epsilon={dp_config.get('epsilon', 1.0)} | "
             f"delta={dp_config.get('delta', 1e-5)} | "
             f"clip_norm={dp_config.get('clip_norm', 0.5)} | "
             f"effective_noise_std={effective_noise:.4f}"
         )
 
-        # 9. Round time summary
         round_time = time.time() - round_start_time
         round_times.append(round_time)
 
@@ -514,16 +520,13 @@ def main():
 
         logging.info(f"Round {round_id} completed")
 
-        clear_round_state(nodes, gossip)
-
     experiment_end_time = time.time()
     total_time = experiment_end_time - experiment_start_time
 
     # ---------------- FINAL SUMMARY ----------------
     logging.info("=" * 80)
-    logging.info("Experiment Completed: FedAvg + DP")
+    logging.info("Experiment Completed: Centralized FedAvg + Differential Privacy")
     logging.info("=" * 80)
-
     logging.info(f"Total training time: {total_time:.2f}s")
 
     if round_accuracies:
@@ -550,7 +553,7 @@ def main():
 
     logging.info(
         f"Final DP setting | "
-        f"target_epsilon={dp_config.get('epsilon', 0.9)} | "
+        f"target_epsilon={dp_config.get('epsilon', 1.0)} | "
         f"clip_norm={dp_config.get('clip_norm', 0.5)} | "
         f"effective_noise_std={effective_noise:.4f} | "
         f"delta={dp_config.get('delta', 1e-5)}"

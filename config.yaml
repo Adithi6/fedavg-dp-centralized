@@ -1,12 +1,8 @@
 
 experiment:
   n_clients: 10
-  n_rounds: 150
+  n_rounds: 20
   local_epochs: 5
-
-gossip:
-  fanout: 2
-  max_hops: 3
 
 logging:
   log_file: experiment.log
